@@ -49,6 +49,9 @@ func SqlInsertObject(ctx context.Context, db *sql.DB, obj any, tableNames ...Tab
 		if len(rows) == 0 {
 			continue
 		}
+		if len(rows) == 1 && rows[0].ColumnCount() <= 1 {
+			continue
+		}
 		placeholders := strings.Repeat("?,", rows[0].ColumnCount())
 		// Get rid of the trailing comma.
 		placeholders = placeholders[:len(placeholders)-1]
