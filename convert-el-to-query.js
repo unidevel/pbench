@@ -368,8 +368,18 @@ async function processFile(inputFile, targetDir) {
           // It's a valid event listener JSON, process as NDJSON
           const results = await processFileAsNdjson(inputFile, targetDir);
           if (results.length > 0) {
-            console.log(`Successfully processed ${inputFile} as NDJSON with ${results.length} records`);
-            return { success: true, file: inputFile, count: results.length };
+            // Count overwritten and skipped files from NDJSON processing
+            const overwrittenCount = results.filter(r => r.overwritten).length;
+            const skippedCount = results.filter(r => r.skipped).length;
+
+            console.log(`Successfully processed ${inputFile} as NDJSON with ${results.length} records (${overwrittenCount} overwritten, ${skippedCount} skipped)`);
+            return {
+              success: true,
+              file: inputFile,
+              count: results.length,
+              overwrittenCount: overwrittenCount,
+              skippedCount: skippedCount
+            };
           }
         } else if (!result.isEventListener) {
           console.warn(`Warning: ${inputFile} is not an event listener JSON file (missing queryId)`);
@@ -396,13 +406,34 @@ async function processFile(inputFile, targetDir) {
         throw new Error(result.error);
       }
 
-      // Get queryId for the output filename
-      const queryId = result.queryInfo.queryId;
-      const outputFile = path.join(targetDir, `${queryId}.json`);
+      // For JSON files, keep the original filename but flatten into target directory
+      const originalFilename = path.basename(inputFile);
+      const outputFile = path.join(targetDir, originalFilename);
+
+      // Convert the result to JSON string
+      const newContent = JSON.stringify(result.queryInfo, null, 2);
+
+      // Check if target file already exists
+      let overwritten = false;
+      if (fs.existsSync(outputFile)) {
+        // Get the size of the existing file
+        const existingStats = fs.statSync(outputFile);
+        const existingSize = existingStats.size;
+        const newSize = Buffer.byteLength(newContent, 'utf8');
+
+        // If the existing file is smaller than the new content, override it
+        if (existingSize < newSize) {
+          console.warn(`Warning: Overwriting smaller file: ${outputFile} (${existingSize} bytes) with larger content (${newSize} bytes)`);
+          overwritten = true;
+        } else {
+          console.warn(`Warning: Target file already exists and is not smaller, skipping: ${outputFile}`);
+          return { success: true, file: inputFile, skipped: true };
+        }
+      }
 
       // Create output stream and write the data
       const outputStream = fs.createWriteStream(outputFile);
-      outputStream.write(JSON.stringify(result.queryInfo, null, 2));
+      outputStream.write(newContent);
       outputStream.end();
 
       // Wait for the stream to finish
@@ -410,8 +441,13 @@ async function processFile(inputFile, targetDir) {
         outputStream.on('finish', resolve);
       });
 
-      console.log(`Successfully converted ${inputFile} to ${outputFile}`);
-      return { success: true, file: inputFile, queryId };
+      if (overwritten) {
+        console.log(`Successfully converted ${inputFile} to ${outputFile} (overwritten)`);
+        return { success: true, file: inputFile, queryId: result.queryInfo.queryId, overwritten: true };
+      } else {
+        console.log(`Successfully converted ${inputFile} to ${outputFile}`);
+        return { success: true, file: inputFile, queryId: result.queryInfo.queryId };
+      }
     } catch (jsonError) {
       // Both NDJSON and JSON parsing failed
       const errorMsg = `Failed to process ${inputFile}: ${jsonError.message}`;
@@ -440,6 +476,8 @@ async function processFileAsNdjson(inputFile, targetDir) {
     const results = [];
     let lineCount = 0;
 
+    // Flatten files into target directory
+
     rl.on('line', async (line) => {
       if (!line.trim()) return; // Skip empty lines
 
@@ -464,13 +502,40 @@ async function processFileAsNdjson(inputFile, targetDir) {
         const queryId = result.queryInfo.queryId;
         const outputFile = path.join(targetDir, `${queryId}.json`);
 
+        // Convert the result to JSON string
+        const newContent = JSON.stringify(result.queryInfo, null, 2);
+
+        // Check if target file already exists
+        let overwritten = false;
+        if (fs.existsSync(outputFile)) {
+          // Get the size of the existing file
+          const existingStats = fs.statSync(outputFile);
+          const existingSize = existingStats.size;
+          const newSize = Buffer.byteLength(newContent, 'utf8');
+
+          // If the existing file is smaller than the new content, override it
+          if (existingSize < newSize) {
+            console.warn(`Warning: Overwriting smaller file: ${outputFile} (${existingSize} bytes) with larger content (${newSize} bytes)`);
+            overwritten = true;
+          } else {
+            console.warn(`Warning: Target file already exists and is not smaller, skipping: ${outputFile}`);
+            results.push({ queryId, lineNumber: lineCount, skipped: true });
+            return;
+          }
+        }
+
         // Create output stream and write the data
         const outputStream = fs.createWriteStream(outputFile);
-        outputStream.write(JSON.stringify(result.queryInfo, null, 2));
+        outputStream.write(newContent);
         outputStream.end();
 
-        console.log(`Successfully converted line ${lineCount} from ${inputFile} to ${outputFile}`);
-        results.push({ queryId, lineNumber: lineCount });
+        if (overwritten) {
+          console.log(`Successfully converted line ${lineCount} from ${inputFile} to ${outputFile} (overwritten)`);
+          results.push({ queryId, lineNumber: lineCount, overwritten: true });
+        } else {
+          console.log(`Successfully converted line ${lineCount} from ${inputFile} to ${outputFile}`);
+          results.push({ queryId, lineNumber: lineCount });
+        }
       } catch (error) {
         const errorMsg = `Error processing line ${lineCount} from ${inputFile}: ${error.message}`;
         console.error(errorMsg);
@@ -495,6 +560,7 @@ function getAllFiles(dirPath, arrayOfFiles = []) {
   const files = fs.readdirSync(dirPath);
 
   files.forEach(file => {
+    if (file.startsWith('.')) return;
     const filePath = path.join(dirPath, file);
     if (fs.statSync(filePath).isDirectory()) {
       arrayOfFiles = getAllFiles(filePath, arrayOfFiles);
@@ -535,6 +601,7 @@ async function main() {
     process.exit(1);
   }
 
+
   try {
     // Check if source directory exists
     if (!fs.existsSync(sourceDir)) {
@@ -548,8 +615,7 @@ async function main() {
     }
 
     // Get all JSON files in the source directory recursively
-    const files = getAllFiles(sourceDir)
-      .filter(file => file.toLowerCase().endsWith('.json'));
+    const files = getAllFiles(sourceDir);
 
     if (files.length === 0) {
       console.error(`No JSON files found in source directory: ${sourceDir}`);
@@ -560,19 +626,49 @@ async function main() {
 
     // Process each file
     const results = [];
+    let overwrittenCount = 0;
+    let skippedCount = 0;
+    let successCount = 0;
+    let failedCount = 0;
+
     for (const file of files) {
       const result = await processFile(file, targetDir);
+
+      if (result.success) {
+        if (result.overwritten) {
+          overwrittenCount++;
+        } else if (result.skipped) {
+          skippedCount++;
+        } else if (result.count) {
+          // This is a NDJSON file with multiple records
+          // Extract overwritten and skipped counts from NDJSON processing
+          const ndjsonResults = result.count;
+          const ndjsonOverwritten = result.overwrittenCount || 0;
+          const ndjsonSkipped = result.skippedCount || 0;
+
+          overwrittenCount += ndjsonOverwritten;
+          skippedCount += ndjsonSkipped;
+          successCount += (ndjsonResults - ndjsonOverwritten - ndjsonSkipped);
+        } else {
+          successCount++;
+        }
+      } else {
+        failedCount++;
+      }
+
       results.push(result);
     }
 
     // Summarize results
-    const successful = results.filter(r => r.success);
-    const failed = results.filter(r => !r.success);
-
     console.log(`\nConversion Summary:`);
-    console.log(`- Successfully processed ${successful.length} files`);
-    if (failed.length > 0) {
-      console.error(`- Failed to process ${failed.length} files`);
+    console.log(`- Successfully processed ${successCount} files`);
+    console.log(`- Overwritten ${overwrittenCount} files (existing files were smaller than new content)`);
+    if (skippedCount > 0) {
+      console.log(`- Skipped ${skippedCount} files (target already exists and is not smaller)`);
+    }
+    if (failedCount > 0) {
+      const failed = results.filter(r => !r.success);
+      console.error(`- Failed to process ${failedCount} files`);
       failed.forEach(f => console.error(`  - ${f.file}: ${f.error}`));
     }
   } catch (error) {
